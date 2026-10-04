@@ -42,6 +42,18 @@ void DrawColorPreview(UiRenderer &ui, UiFontHandle labelFont, AppSettings *setti
     float x = rowX + MenuList::kIconSize + MenuList::kIconTextGap + labelWidth + kSwatchLeftGap;
     const float y = rowY + (rowH - kSwatchSize) / 2.0f;
 
+    // A per-shade palette's own 4 colors - exactly what each shade shows on
+    // screen at full brightness (see ShadeColorizer).
+    if (settings->selectedShadePalette >= 0 && settings->selectedShadePalette < kShadePaletteCount)
+    {
+        for (const XrColor4f &shade : kShadePalettes[settings->selectedShadePalette])
+        {
+            ui.DrawQuadRounded(x, y, kSwatchSize, kSwatchSize, XrColor4f{shade.r, shade.g, shade.b, alpha}, 1.0f);
+            x += kSwatchSize + kSwatchGap;
+        }
+        return;
+    }
+
     // A pattern's 5 gradient stops stand in for the 4 tint brightness
     // swatches below - same kScreenPatterns array the screen shader itself
     // reads (see Settings.h), so this always matches what's actually drawn.
@@ -83,9 +95,15 @@ void SettingsPage::Init(UiRenderer &ui, const UiMenuResources &resources)
     list->AddSpacer(kMenuSpacerSize);
 
     UiFontHandle menuFont = resources.menuFont;
-    list->AddEntry(kColorPaletteLabel, [this](MenuItem *) { ChangePalette(1); }, // Select acts like Right - advance the palette
-        [this](MenuItem *) { ChangePalette(-1); }, [this](MenuItem *) { ChangePalette(1); }, UiIconId::Palette,
+    // Color Mode picks the kind of coloring (see ColorMode in
+    // SettingsPage.h); Color Palette then only cycles that mode's presets,
+    // so each list stays short and the modes are discoverable by name.
+    m_colorModeEntry = list->AddEntry("Color Mode: Tint", [this](MenuItem *) { ChangeColorMode(1); }, // Select acts like Right
+        [this](MenuItem *) { ChangeColorMode(-1); }, [this](MenuItem *) { ChangeColorMode(1); }, UiIconId::Palette);
+    auto paletteEntry = list->AddEntry(kColorPaletteLabel, [this](MenuItem *) { ChangePalette(1); }, // Select acts like Right - advance the palette
+        [this](MenuItem *) { ChangePalette(-1); }, [this](MenuItem *) { ChangePalette(1); }, UiIconId::None,
         [this, menuFont](UiRenderer &ui, float x, float y, float w, float h, float a) { DrawColorPreview(ui, menuFont, m_settings, x, y, w, h, a); });
+    paletteEntry->reserveIconSpace = true; // indented under Color Mode, like the R/G/B rows
     m_colorREntry = list->AddEntry("Red: 1.00", [this](MenuItem *) { ChangeColorChannel(&AppSettings::colorR, kColorStep); },
         [this](MenuItem *) { ChangeColorChannel(&AppSettings::colorR, -kColorStep); },
         [this](MenuItem *) { ChangeColorChannel(&AppSettings::colorR, kColorStep); });
@@ -131,36 +149,63 @@ void SettingsPage::Init(UiRenderer &ui, const UiMenuResources &resources)
     RefreshLabels();
 }
 
+SettingsPage::ColorMode SettingsPage::CurrentColorMode() const
+{
+    // Derived from which palette field is set rather than stored, so it can
+    // never disagree with what's actually being drawn.
+    if (m_settings->selectedShadePalette >= 0)
+        return ColorMode::Multicolor;
+    if (m_settings->selectedPattern >= 0)
+        return ColorMode::Gradient;
+    return ColorMode::Tint;
+}
+
+void SettingsPage::ChangeColorMode(int delta)
+{
+    if (!m_settings)
+        return;
+
+    // Remember the palette being left, so cycling back to its mode returns
+    // to it (this session only - the active one is what's saved to disk).
+    const ColorMode current = CurrentColorMode();
+    if (current == ColorMode::Gradient)
+        m_lastPattern = m_settings->selectedPattern;
+    else if (current == ColorMode::Multicolor)
+        m_lastShadePalette = m_settings->selectedShadePalette;
+
+    const int next = (static_cast<int>(current) + delta + kColorModeCount) % kColorModeCount;
+    // Tint needs nothing set: colorR/G/B (and selectedPalette) are kept
+    // untouched while another mode is active, so the previous tint returns.
+    m_settings->selectedPattern = next == static_cast<int>(ColorMode::Gradient) ? m_lastPattern : -1;
+    m_settings->selectedShadePalette = next == static_cast<int>(ColorMode::Multicolor) ? m_lastShadePalette : -1;
+    RefreshLabels();
+}
+
 void SettingsPage::ChangePalette(int delta)
 {
     if (!m_settings)
         return;
-    // One combined cycle: the flat-tint presets, then the gradient patterns
-    // (kScreenPatterns) - exactly one of selectedPalette/selectedPattern is
-    // "active" on any given index (see RefreshLabels, which hides the R/G/B
-    // rows for the pattern half).
-    constexpr int kTotal = kPredefColorCount + kScreenPatternCount;
-
-    int index;
-    if (m_settings->selectedPattern >= 0)
-        index = kPredefColorCount + m_settings->selectedPattern;
-    else if (m_settings->selectedPalette >= 0)
-        index = m_settings->selectedPalette;
-    else
-        index = 0; // was on a custom (non-preset) color - start cycling from the first preset
-
-    index = (index + delta + kTotal) % kTotal;
-    if (index < kPredefColorCount)
+    // Cycles only the presets of the current Color Mode - see ChangeColorMode.
+    switch (CurrentColorMode())
     {
+    case ColorMode::Tint:
+    {
+        // -1 = a custom R/G/B color - start cycling from the first preset.
+        int index = m_settings->selectedPalette >= 0 ? m_settings->selectedPalette : 0;
+        index = (index + delta + kPredefColorCount) % kPredefColorCount;
         m_settings->selectedPalette = index;
-        m_settings->selectedPattern = -1;
         m_settings->colorR = kPredefColors[index].r;
         m_settings->colorG = kPredefColors[index].g;
         m_settings->colorB = kPredefColors[index].b;
+        break;
     }
-    else
-    {
-        m_settings->selectedPattern = index - kPredefColorCount;
+    case ColorMode::Gradient:
+        m_settings->selectedPattern = (m_settings->selectedPattern + delta + kScreenPatternCount) % kScreenPatternCount;
+        break;
+    case ColorMode::Multicolor:
+        m_settings->selectedShadePalette =
+            (m_settings->selectedShadePalette + delta + kShadePaletteCount) % kShadePaletteCount;
+        break;
     }
     RefreshLabels();
 }
@@ -175,6 +220,7 @@ void SettingsPage::ChangeColorChannel(float AppSettings::*channel, float delta)
     if (value > 1.0f) value = 1.0f;
     m_settings->selectedPalette = -1; // diverges from whatever preset was selected, matches FrontendGo
     m_settings->selectedPattern = -1; // R/G/B rows are only reachable in tint mode anyway, but stay defensive
+    m_settings->selectedShadePalette = -1;
     RefreshLabels();
 }
 
@@ -193,14 +239,17 @@ void SettingsPage::RefreshLabels()
     // Color Palette's label stays static ("Color Palette") - its row draws
     // the actual colors via DrawColorPreview instead of a selected-index
     // number (see AddEntry's accessoryDraw above).
+    static constexpr const char *kModeNames[kColorModeCount] = {"Tint", "Gradient", "Multicolor"};
+    m_colorModeEntry->SetText(std::string("Color Mode: ") + kModeNames[static_cast<int>(CurrentColorMode())]);
     // 2 decimals, not 3 - kColorStep is 0.05, so the third decimal is always
     // 0 and never actually reachable by adjusting the value.
     m_colorREntry->SetText(FormatFloat("Red: ", m_settings->colorR, 2));
     m_colorGEntry->SetText(FormatFloat("Green: ", m_settings->colorG, 2));
     m_colorBEntry->SetText(FormatFloat("Blue: ", m_settings->colorB, 2));
-    // A gradient pattern has no R/G/B of its own to adjust - hide those
-    // rows entirely while one's selected (see MenuList::Entry::Visible).
-    const bool tintMode = m_settings->selectedPattern < 0;
+    // A gradient pattern or per-shade palette has no R/G/B of its own to
+    // adjust - hide those rows entirely while one's selected (see
+    // MenuList::Entry::Visible).
+    const bool tintMode = CurrentColorMode() == ColorMode::Tint;
     m_colorREntry->Visible = tintMode;
     m_colorGEntry->Visible = tintMode;
     m_colorBEntry->Visible = tintMode;
